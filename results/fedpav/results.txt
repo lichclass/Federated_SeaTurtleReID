@@ -1,0 +1,5 @@
+Best Validation Rank-1 Accuracy: 82.57% at round 36
+(Global) Test Accuracies:     Rank-1 Accuracy: 81.05%     Rank-5 Accuracy: 91.06%
+     mAP@1: 85.46%     mAP@5: 60.80%
+(Cross-Client) Test Accuracies:     Rank-1 Accuracy: 80.92%     Rank-5 Accuracy: 90.83%
+     mAP@1: 85.34%     mAP@5: 60.27%
