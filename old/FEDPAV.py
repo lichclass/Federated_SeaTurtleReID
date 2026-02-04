@@ -29,8 +29,7 @@ from wildlife_datasets.datasets import SeaTurtleID2022
 from wildlife_tools.data import ImageDataset
 from wildlife_datasets.splits import ClosedSetSplit
 
-os.environ['KAGGLE_USERNAME'] = "nashadammuoz"
-os.environ['KAGGLE_KEY'] = "KGAT_9f227e36a409b0debe5ee7a27090bd72"
+
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 torch.set_float32_matmul_precision('high')
 torch.backends.cudnn.benchmark = True
@@ -406,7 +405,6 @@ class FederatedClient:
         self.cpu_device = torch.device('cpu')
 
         self.unique_identities = sorted(self.train_df['identity'].unique().tolist())
-        self.local_classes_set = set(self.unique_identities)
         self.num_local_classes = len(self.unique_identities)
 
         if prototype_backbone is not None:
@@ -417,12 +415,8 @@ class FederatedClient:
         head = AdaFaceHead(embedding_size=config['embedding_dim'], num_classes=self.num_local_classes)
         self.model = ReIDModel(backbone, head).to(self.cpu_device)
 
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=config['lr'],
-            weight_decay=self.config['w_decay']
-        )
-        self.scaler = grad_scaler.GradScaler()
+        # NOTE: Optimizer is NOT initialized here anymore to avoid Stale Momentum.
+        # It is initialized inside train().
 
         t_train = T.Compose([
             T.Resize((self.config['image_size'], self.config['image_size'])),
@@ -433,7 +427,6 @@ class FederatedClient:
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             T.RandomErasing(p=0.5, scale=(0.02, 0.33)),
         ])
-
         dataset = ImageDataset(
             self.train_df,
             root=self.config['root'],
@@ -454,98 +447,41 @@ class FederatedClient:
 
         print(f"Client {self.client_id} - Model initialized (CPU-Resident).")
 
-    def compute_prototypes(self):
-        self.model.eval()
-        self.model.to(self.device)
-
-        # Client set
-        transform = T.Compose([
-            T.Resize((self.config['image_size'], self.config['image_size'])),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        dataset = ImageDataset(
-            self.train_df,
-            root=self.config['root'],
-            transform=transform,
-            col_path='path',
-            col_label='identity'
-        )
-        loader = DataLoader(
-            dataset,
-            batch_size=self.config['batch_size'],
-            shuffle=False,
-            num_workers=4, 
-            pin_memory=True,
-        )
-
-        agg_protos = {}
-        counts = {}
-
-        with torch.no_grad():
-            pbar = tqdm(loader, desc=f"Client {self.client_id} - Computing Prototypes")
-            for imgs, labels in pbar:
-                imgs = imgs.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
-
-                emb, _ = self.model.backbone(imgs)
-                emb = emb.cpu().numpy()
-                labels = labels.cpu().numpy()
-
-                for i, lbl in enumerate(labels):
-                    global_id = self.unique_identities[lbl]
-
-                    if global_id not in agg_protos:
-                        agg_protos[global_id] = np.zeros_like(emb[i])
-                        counts[global_id] = 0
-                    
-                    agg_protos[global_id] += emb[i]
-                    counts[global_id] += 1
-
-        # Average the prototypes
-        local_prototypes = {}
-        for gid, total_emb in agg_protos.items():
-            mean_emb = total_emb / counts[gid]
-            local_prototypes[gid] = mean_emb
-
-        self.model.to(self.cpu_device)
-        return local_prototypes
-
-
     def train(self, server_msg):
         self.model.to(self.device)
-        optimizer_to(self.optimizer, self.device)
+        
+        # --- FIX: Re-initialize Optimizer Every Round ---
+        # This ensures we don't apply momentum from the previous round (old weights) 
+        # to the new global weights (new starting point).
+        optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.config['lr'],
+            weight_decay=self.config['w_decay']
+        )
+        scaler = grad_scaler.GradScaler()
+        
+        optimizer_to(optimizer, self.device)
 
         global_weights = server_msg['model_state']
         global_weights = {
             k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
             for k, v in global_weights.items()
         }
+        # Load Global Backbone (Partial Averaging / FedPer)
         self.model.backbone.load_state_dict(global_weights, strict=True)
-
-        global_prototypes = server_msg['global_prototypes']
-        global_protos_tensor = {
-            k: torch.tensor(v, device=self.device)
-            for k, v in global_prototypes.items()
-        }
-
         self.model.train()
 
         current_lr = server_msg['current_lr']
-        for param_group in self.optimizer.param_groups:
+        for param_group in optimizer.param_groups:
             param_group['lr'] = current_lr
 
-        criterion_task = nn.CrossEntropyLoss()
-        criterion_mse = nn.MSELoss(reduction='sum')
+        criterion = nn.CrossEntropyLoss()
+        loader = self.loader
 
-        lambda_proto = self.config['lambda_proto']
-
-        epoch_loss, epoch_loss_cls, epoch_loss_proto = 0.0, 0.0, 0.0
-        total_samples = 0
-        
         for epoch in range(self.config['local_epochs']):
+            epoch_loss = 0.0
             
-            pbar = tqdm(self.loader, desc=f"Client {self.client_id} Epoch {epoch+1}", leave=False)
+            pbar = tqdm(loader, desc=f"Client {self.client_id} Epoch {epoch+1}")
             
             for imgs, labels in pbar:
                 imgs, labels = imgs.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
@@ -553,59 +489,31 @@ class FederatedClient:
 
                 with autocast_mode.autocast(device_type='cuda'):
                     logits, emb = self.model(imgs, labels)
-                    loss_task = criterion_task(logits, labels)
+                    loss = criterion(logits, labels)
 
-                    # Prototype Alignment Loss
-                    loss_proto = torch.tensor(0.0, device=self.device)
-                    if len(global_protos_tensor) > 0:
-                        batch_global_ids = [self.unique_identities[lbl.item()] for lbl in labels]
-                        valid_indices = []
-                        batch_target_protos = []
-
-                        for idx, gid in enumerate(batch_global_ids):
-                            if gid in global_protos_tensor:
-                                valid_indices.append(idx)
-                                batch_target_protos.append(global_protos_tensor[gid])
-
-                        if len(valid_indices) > 0:
-                            target_protos = torch.stack(batch_target_protos)
-                            current_embeddings = emb[valid_indices]
-                            loss_proto = criterion_mse(current_embeddings, target_protos)
-                    
-                    loss_proto = lambda_proto * loss_proto
-                    loss = loss_task + loss_proto
-
-                self.optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(loss).backward()
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
 
-                epoch_loss_cls += loss_task.item() * batch_size
-                epoch_loss_proto += loss_proto.item() * batch_size
                 epoch_loss += loss.item() * batch_size
-                total_samples += batch_size
-
-                del loss, logits, emb
-            
-
-        local_prototypes = self.compute_prototypes()
+        
         self.model.to(self.cpu_device)
         torch.cuda.synchronize()
-        optimizer_to(self.optimizer, self.cpu_device)
+        optimizer_to(optimizer, self.cpu_device)
         torch.cuda.empty_cache()
+
+        dataset_len = len(self.train_df)
 
         return {
             'client_id': self.client_id,
             'model_state': self.model.backbone.state_dict(),
-            'local_prototypes': local_prototypes,
-            'num_samples': total_samples,
-            'loss': epoch_loss / total_samples,
-            'loss_cls': epoch_loss_cls / total_samples,
-            'loss_proto': epoch_loss_proto / total_samples,
+            'num_samples': dataset_len,
+            'loss': epoch_loss / dataset_len,
         }
 
-    def evaluate_client(self, gallery_set, query_set, mAP_at=[1,5]):
+    def evaluate(self, gallery_set, query_set, mAP_at=[1,5]):
         eval_model = ReIDModel(self.model.backbone, nn.Identity()).to(self.device)
         rank1, rank5, mAP = evaluate(
             eval_model, 
@@ -632,40 +540,46 @@ class FederatedServer:
         warmup_scheduler = LinearLR(self.dummy_optimizer, start_factor=0.1, total_iters=warmup_rounds)
         self.scheduler = SequentialLR(self.dummy_optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_rounds])
 
-        self.global_prototypes = {}
-
     def step_scheduler(self):
         self.scheduler.step()
         self.current_lr = self.scheduler.get_last_lr()[0]
         print(f"[Server] Learning Rate updated to: {self.current_lr:.6f}")
 
-    def aggregate(self, client_msgs, mode='hybrid'):
+    def aggregate(self, client_msgs):
         print("[Server] Aggregating Weights and Prototypes...")
 
-        new_global_prototypes = {}
-        prototype_counts = {}
+        total_samples = sum(msg['num_samples'] for msg in client_msgs)
+        first_msg = client_msgs[0]
+        w_factor = first_msg['num_samples'] / total_samples
 
-        for msg in client_msgs:
-            local_protos = msg['local_prototypes']
+        agg_state = {}
+        for k, v in first_msg['model_state'].items():
+            agg_state[k] = torch.zeros_like(v, device=self.device)
+            agg_state[k].add_(v.to(self.device, non_blocking=True), alpha=w_factor)
 
-            for gid, embedding in local_protos.items():
-                if gid not in new_global_prototypes:
-                    new_global_prototypes[gid] = np.zeros_like(embedding)
-                    prototype_counts[gid] = 0
-                new_global_prototypes[gid] += embedding
-                prototype_counts[gid] += 1
+        for i in range(1, len(client_msgs)):
+            msg = client_msgs[i]
+            w_factor = msg['num_samples'] / total_samples
+            state = msg['model_state']
+            for k in agg_state:
+                agg_state[k].add_(state[k].to(self.device, non_blocking=True), alpha=w_factor)
 
-            for gid in new_global_prototypes.keys():
-                avg_proto = new_global_prototypes[gid] / prototype_counts[gid]
-                avg_proto = F.normalize(torch.tensor(avg_proto), dim=0).numpy()
-                self.global_prototypes[gid] = avg_proto
+        self.global_backbone.load_state_dict(agg_state)
 
-        print(f"[Server] Aggregated Prototypes for {len(self.global_prototypes)} unique identities.")
-        
+    def evaluate(self, gallery_set, query_set, mAP_at=[1,5]):
+        eval_model = ReIDModel(self.global_backbone, nn.Identity()).to(self.device)
+        rank1, rank5, mAP = evaluate(
+            eval_model, 
+            gallery_set, 
+            query_set, 
+            self.device, 
+            batch_size=self.config['batch_size'], 
+            mAP_at=mAP_at
+        )
+        return rank1, rank5, mAP
 
     def distribute(self):
         comm_msg = {
-            'global_prototypes': self.global_prototypes,
             'model_state': self.global_backbone.state_dict(),
             'current_lr': self.current_lr
         }
@@ -775,9 +689,9 @@ def main(config):
     best_round = 0
     mAPs_at = [1,5]
     history = {
-        'clients_val_rank1': [],
-        'clients_val_rank5': [],
-        'clients_val_mAP': {k: [] for k in mAPs_at},
+        'global_rank1': [],
+        'global_rank5': [],
+        'global_mAP': {k: [] for k in mAPs_at},
         'losses': {f'loss_C{i}': [] for i in range(config['num_clients'])},
     }
     end_time = time.time()
@@ -798,7 +712,7 @@ def main(config):
             history['losses'][client_key].append(results['loss'])
             client_end_time = time.time()
             client_elapsed = client_end_time - client_start_time
-            print(f"[Client {client.client_id}] Training Loss Total/Cls/Proto: {results['loss']:.4f}/{results['loss_cls']:.4f}/{results['loss_proto']:.4f}, Time: {client_elapsed/60:.2f} minutes")
+            print(f"[Client {client.client_id}] Training Loss: {results['loss']:.4f}, Time: {client_elapsed/60:.2f} minutes")
 
         agg_start_time = time.time()
         print("[Server] Aggregating Client Models...")
@@ -811,31 +725,22 @@ def main(config):
         # --- Validation ---
         eval_start_time = time.time()
         print("[Server] Evaluating Global Model on Validation Set...")
+        global_val_r1, global_val_r5, global_val_map = server.evaluate(val_gallery_set, val_query_set, mAP_at=mAPs_at)
+        print(f"  (Global Model) Validation Rank-1: {global_val_r1*100:.2f}%, Rank-5: {global_val_r5*100:.2f}%")
+        history['global_rank1'].append(global_val_r1)
+        history['global_rank5'].append(global_val_r5)
+        for k in mAPs_at:
+            history['global_mAP'][k].append(global_val_map[mAPs_at.index(k)])
 
-        clients_val_r1, clients_val_r5 = 0.0, 0.0
-        clients_val_map = [0.0] * len(mAPs_at)
-        for client in clients:
-            client_rank1, client_rank5, client_map = client.evaluate_client(val_gallery_set, val_query_set, mAP_at=mAPs_at)
-            clients_val_r1 += client_rank1
-            clients_val_r5 += client_rank5
-            clients_val_map = [x + y for x, y in zip(clients_val_map, client_map)]
-        clients_val_r1 /= config['num_clients']
-        clients_val_r5 /= config['num_clients']
-        clients_val_map = [x / config['num_clients'] for x in clients_val_map]
 
-        history['clients_val_rank1'].append(clients_val_r1)
-        history['clients_val_rank5'].append(clients_val_r5)
-        for idx, at in enumerate(mAPs_at):
-            history['clients_val_mAP'][at].append(clients_val_map[idx])
-
-        print(f"  (Cross-Client) Validation Rank-1: {clients_val_r1*100:.2f}%, Rank-5: {clients_val_r5*100:.2f}%, mAP@1: {clients_val_map[0]*100:.2f}%, mAP@5: {clients_val_map[1]*100:.2f}%")
-
-        if clients_val_r1 > best_val_rank1:
-            best_val_rank1 = clients_val_r1
+        if global_val_r1 > best_val_rank1:
+            best_val_rank1 = global_val_r1
             best_round = round_idx
             early_stopping_counter = 0
 
             print("[Server] Saving Best Global Model...")
+            torch.save(server.global_backbone.state_dict(), results_path / 'best_backbone.pth')
+            
             for client in clients:
                 torch.save(client.model.backbone.state_dict(), results_path / f'best_backbone_client{client.client_id}.pth')
 
@@ -859,13 +764,17 @@ def main(config):
 
     print(f"\n=== Training Complete. Best Validation Rank-1: {best_val_rank1*100:.2f}% at round {best_round} ===")
     print("[Server] Loading Best Model for Final Evaluation...")
+
+    best_state = torch.load(results_path / 'best_backbone.pth')
+    server.global_backbone.load_state_dict(best_state)
+    global_test_r1, global_test_r5, global_test_map = server.evaluate(test_gallery_set, test_query_set, mAP_at=[1,5])
     
     clients_test_r1, clients_test_r5 = 0.0, 0.0
     clients_test_map = [0.0] * len(mAPs_at)
     for client in clients:
         best_state = torch.load(results_path / f'best_backbone_client{client.client_id}.pth')
         client.model.backbone.load_state_dict(best_state)
-        cr1, cr5, cmap = client.evaluate_client(test_gallery_set, test_query_set, mAP_at=[1,5])
+        cr1, cr5, cmap = client.evaluate(test_gallery_set, test_query_set, mAP_at=[1,5])
         clients_test_r1 += cr1
         clients_test_r5 += cr5
         clients_test_map = [x + y for x, y in zip(clients_test_map, cmap)]
@@ -873,11 +782,18 @@ def main(config):
     clients_test_r5 /= config['num_clients']
     clients_test_map = [x / config['num_clients'] for x in clients_test_map]
 
+    print(f"[Server] Final Test Set Performance - (Global) Rank-1: {global_test_r1*100:.2f}%, Rank-5: {global_test_r5*100:.2f}%")
     print(f"[Server] Final Test Set Performance - (Cross-Client) Rank-1: {clients_test_r1*100:.2f}%, Rank-5: {clients_test_r5*100:.2f}%")
+    print(f"[Server] Final Test Set mAP - (Global) mAP@1: {global_test_map[0]*100:.2f}%, mAP@5: {global_test_map[1]*100:.2f}%")
     print(f"[Server] Final Test Set mAP - (Cross-Client) mAP@1: {clients_test_map[0]*100:.2f}%, mAP@5: {clients_test_map[1]*100:.2f}%")
 
     with open(results_path / 'results.txt', 'w') as f:
         f.write(f"Best Validation Rank-1 Accuracy: {best_val_rank1*100:.2f}% at round {best_round}\n")
+        f.write(f"(Global) Test Accuracies:")
+        f.write(f"     Rank-1 Accuracy: {global_test_r1*100:.2f}%")
+        f.write(f"     Rank-5 Accuracy: {global_test_r5*100:.2f}%\n")
+        f.write(f"     mAP@1: {global_test_map[0]*100:.2f}%")
+        f.write(f"     mAP@5: {global_test_map[1]*100:.2f}%\n")
         f.write(f"(Cross-Client) Test Accuracies:")
         f.write(f"     Rank-1 Accuracy: {clients_test_r1*100:.2f}%")
         f.write(f"     Rank-5 Accuracy: {clients_test_r5*100:.2f}%\n")
@@ -890,7 +806,7 @@ if __name__ == "__main__":
         'results_root': './results/federated_reid',
         'image_size': 384,
         'batch_size': 64,
-        'patience': 7,
+        'patience': 12,
 
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'seed': 42,
@@ -908,38 +824,13 @@ if __name__ == "__main__":
         'local_epochs': 3,
         'rounds': 50,
         'warmup_rounds': 5,
-
-        # FedProto
-        'lambda_proto': 0.1,
     }
 
     experiments = [
         {
-            'results_name': 'FEDRPROTO_CLOSED_SET_LAMBDA_005', 
+            'results_name': 'FEDREID_CLOSED_SET_HEAD',
             'body_part': 'head',
             'set': 'closed',
-            'lambda_proto': 0.05,
-            'seeds': [42]
-        },
-        {
-            'results_name': 'FEDRPROTO_CLOSED_SET_LAMBDA_01', 
-            'body_part': 'head',
-            'set': 'closed',
-            'lambda_proto': 0.1,
-            'seeds': [42]
-        },
-        {
-            'results_name': 'FEDRPROTO_CLOSED_SET_LAMBDA_02', 
-            'body_part': 'head',
-            'set': 'closed',
-            'lambda_proto': 0.2,
-            'seeds': [42]
-        },
-        {
-            'results_name': 'FEDRPROTO_CLOSED_SET_LAMBDA_04', 
-            'body_part': 'head',
-            'set': 'closed',
-            'lambda_proto': 0.4,
             'seeds': [42]
         },
     ]

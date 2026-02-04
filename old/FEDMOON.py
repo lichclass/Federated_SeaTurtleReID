@@ -29,8 +29,6 @@ from wildlife_datasets.datasets import SeaTurtleID2022
 from wildlife_tools.data import ImageDataset
 from wildlife_datasets.splits import ClosedSetSplit
 
-os.environ['KAGGLE_USERNAME'] = "nashadammuoz"
-os.environ['KAGGLE_KEY'] = "KGAT_9f227e36a409b0debe5ee7a27090bd72"
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 torch.set_float32_matmul_precision('high')
 torch.backends.cudnn.benchmark = True
