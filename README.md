@@ -15,10 +15,3 @@ Proponents:
 
 - Nash Adam Muñoz
 - Elijah Kahlil Andres Abangan
-
----
-
-Status:
-
-- Code Refactorization and Standardization
-- Developing Software Application for Inference
